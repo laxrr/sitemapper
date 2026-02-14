@@ -45,7 +45,131 @@ function analyze(urls) {
   return { types, depths, canonicalCount: canonical.size };
 }
 
+function pct(n, d) {
+  if (!d || d <= 0) return "0.0%";
+  return `${((n / d) * 100).toFixed(1)}%`;
+}
+
+function countMatches(urls, needle) {
+  const s = String(needle || "").toLowerCase();
+  if (!s) return 0;
+
+  let count = 0;
+  for (const u of urls || []) {
+    let haystack = "";
+    try {
+      haystack = new URL(u).pathname.toLowerCase();
+    } catch {
+      haystack = String(u || "").toLowerCase();
+    }
+
+    if (haystack.includes(s)) count += 1;
+  }
+
+  return count;
+}
+
+function buildAlerts(allUrls) {
+  const urls = Array.isArray(allUrls) ? allUrls : [];
+  const totalUrls = urls.length;
+  const alerts = [];
+
+  if (!totalUrls) {
+    return [{ level: "green", msg: "No obvious red flags detected." }];
+  }
+
+  const { types, depths, canonicalCount } = analyze(urls);
+
+  // A) Canonical ratio
+  const canonicalRatio = canonicalCount / totalUrls;
+  if (canonicalRatio < 0.35) {
+    alerts.push({
+      level: "red",
+      msg: `Low canonical ratio: ${pct(canonicalCount, totalUrls)} (${canonicalCount}/${totalUrls}).`
+    });
+  } else if (canonicalRatio <= 0.60) {
+    alerts.push({
+      level: "yellow",
+      msg: `Canonical ratio is borderline: ${pct(canonicalCount, totalUrls)} (${canonicalCount}/${totalUrls}).`
+    });
+  }
+
+  // B) Unexpected types
+  const known = new Set(["products", "collections", "pages", "blogs", "root"]);
+  let unknownCount = 0;
+  for (const [type, count] of Object.entries(types)) {
+    if (!known.has(type)) unknownCount += count;
+  }
+  const unknownRatio = unknownCount / totalUrls;
+  if (unknownRatio > 0.01) {
+    alerts.push({
+      level: "red",
+      msg: `Unexpected URL types are high: ${pct(unknownCount, totalUrls)} (${unknownCount}/${totalUrls}).`
+    });
+  } else if (unknownRatio > 0.002) {
+    alerts.push({
+      level: "yellow",
+      msg: `Unexpected URL types detected: ${pct(unknownCount, totalUrls)} (${unknownCount}/${totalUrls}).`
+    });
+  }
+
+  // C) Deep URLs (depth >= 5)
+  let deepCount = 0;
+  for (const [depth, count] of Object.entries(depths)) {
+    if (Number(depth) >= 5) deepCount += count;
+  }
+  const deepRatio = deepCount / totalUrls;
+  if (deepRatio > 0.10) {
+    alerts.push({
+      level: "red",
+      msg: `Too many deep URLs (depth >= 5): ${pct(deepCount, totalUrls)} (${deepCount}/${totalUrls}).`
+    });
+  } else if (deepRatio > 0.03) {
+    alerts.push({
+      level: "yellow",
+      msg: `Deep URL share is elevated (depth >= 5): ${pct(deepCount, totalUrls)} (${deepCount}/${totalUrls}).`
+    });
+  }
+
+  // D) "copy-of" products
+  const copyOfCount = countMatches(urls, "/products/copy-of-");
+  const productCount = types["products"] || 0;
+  const copyRatio = productCount ? copyOfCount / productCount : 0;
+  if (copyRatio > 0.02) {
+    alerts.push({
+      level: "red",
+      msg: `High "copy-of" product ratio: ${pct(copyOfCount, productCount)} (${copyOfCount}/${productCount}).`
+    });
+  } else if (copyRatio > 0.005) {
+    alerts.push({
+      level: "yellow",
+      msg: `"copy-of" products detected: ${pct(copyOfCount, productCount)} (${copyOfCount}/${productCount}).`
+    });
+  }
+
+  if (!alerts.length) {
+    alerts.push({ level: "green", msg: "No obvious red flags detected." });
+  }
+
+  return alerts;
+}
+
+function renderAlerts(allUrls) {
+  const alertsEl = document.getElementById("alerts");
+  if (!alertsEl) return;
+
+  const icons = { green: "✅", yellow: "⚠️", red: "🚩" };
+  const colors = { green: "#1d6f42", yellow: "#8a5a00", red: "#a31818" };
+  const alerts = buildAlerts(allUrls);
+
+  alertsEl.innerHTML = alerts
+    .map(a => `<div class="stat" style="color:${colors[a.level] || "inherit"};">${icons[a.level] || "✅"} ${a.msg}</div>`)
+    .join("");
+}
+
 function renderAdvanced(urls) {
+  renderAlerts(urls);
+
   const statsEl = document.getElementById("stats");
   const depthEl = document.getElementById("depth");
   if (!statsEl || !depthEl) return;
