@@ -2,6 +2,15 @@ function originKey(origin) {
   return `sitemap:${origin}`;
 }
 
+function escapeHtml(v) {
+  return String(v ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 async function getActiveTabOrigin() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.url) return null;
@@ -545,7 +554,7 @@ async function run() {
   if (metaEl) {
     metaEl.textContent = REC.found
       ? `Found • ${REC.urlCount} URLs`
-      : `No sitemap found (cached)`;
+      : `No sitemap found or blocked`;
   }
 
   ALL_URLS = Array.isArray(REC.urls) ? REC.urls : [];
@@ -569,11 +578,22 @@ async function run() {
   // Detail area
   const scanned = REC.scannedAt ? new Date(REC.scannedAt).toLocaleString() : "unknown";
   const sitemap = REC.sitemapUrl ? REC.sitemapUrl : null;
+  const firstError = Array.isArray(REC.errors) && REC.errors.length
+    ? String(REC.errors[0] || "")
+    : "";
 
   if (detailEl) {
+    const sitemapHtml = sitemap
+      ? `<a href="${escapeHtml(sitemap)}" target="_blank">${escapeHtml(sitemap)}</a>`
+      : "<b>none</b>";
+    const failureReasonHtml = !REC.found
+      ? `<br>Reason: <b>${escapeHtml(firstError || "No sitemap found or blocked")}</b>`
+      : "";
+
     const baseHtml =
       `Scanned: <b>${scanned}</b><br>` +
-      `Sitemap: ${sitemap ? `<a href="${sitemap}" target="_blank">${sitemap}</a>` : "<b>none</b>"}`;
+      `Sitemap: ${sitemapHtml}` +
+      failureReasonHtml;
 
     detailEl.setAttribute("data-base", baseHtml);
     detailEl.innerHTML = baseHtml;

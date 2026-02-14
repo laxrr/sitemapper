@@ -1,10 +1,13 @@
 // Sitemap Sniffer (content script)
-// Runs on every page load, attempts to find sitemaps for the current origin,
-// parses them, cleans URLs, and stores results in chrome.storage.local.
+// Runs on page load, discovers sitemap entry points, recursively parses sitemap
+// indexes/urlsets, and stores a normalized record in chrome.storage.local.
 
 const TTL_MS = 6 * 60 * 60 * 1000; // 6 hours per origin cache
-const MAX_URLS = 4000;            // safety cap
-const MAX_FETCH_BYTES = 3_000_000; // ~3MB cap per fetch
+const LIMITS = {
+  maxDepth: 3,
+  maxSitemapsFetched: 30,
+  maxUrlsStored: 10000
+};
 
 function originKey(origin) {
   return `sitemap:${origin}`;
@@ -14,199 +17,287 @@ function now() {
   return Date.now();
 }
 
-function safeUrl(u) {
-  try { return new URL(u); } catch { return null; }
+function safeUrl(u, base) {
+  try { return new URL(u, base); } catch { return null; }
+}
+
+function errMsg(err) {
+  return String(err?.message || err || "unknown error");
+}
+
+function pushError(state, message) {
+  if (!message) return;
+  state.errors.push(String(message));
+}
+
+function pushTried(state, url, status, error) {
+  const row = { url: String(url), status };
+  if (error) row.error = String(error);
+  state.tried.push(row);
+}
+
+function markTruncated(state) {
+  if (state.truncated) return;
+  state.truncated = true;
+  pushError(state, `URL list truncated at ${state.limits.maxUrlsStored}.`);
 }
 
 function normalizeUrl(u) {
-  // Cleanse: strip hash + query, trim whitespace, normalize trailing slash (lightly)
-  const url = safeUrl(u?.trim());
+  const url = safeUrl(String(u || "").trim());
   if (!url) return null;
 
-  url.hash = "";
-  url.search = "";
-
-  // Optional: normalize "index.html" -> "/" (common cleanup)
   if (url.pathname.endsWith("/index.html")) {
-    url.pathname = url.pathname.slice(0, -"/index.html".length) + "/";
-  }
-
-  // Optional: remove duplicate trailing slash except root
-  if (url.pathname.length > 1 && url.pathname.endsWith("/")) {
-    // keep single trailing slash; fine as-is
+    url.pathname = `${url.pathname.slice(0, -"/index.html".length)}/`;
   }
 
   return url.toString();
 }
 
-async function fetchTextCapped(url) {
-  const res = await fetch(url, { credentials: "omit", cache: "no-store" });
-  if (!res.ok) throw new Error(`Fetch failed ${res.status} for ${url}`);
-
-  // Cap size by reading as text and slicing
-  const text = await res.text();
-  if (text.length > MAX_FETCH_BYTES) {
-    return text.slice(0, MAX_FETCH_BYTES);
-  }
-  return text;
-}
-
-function extractSitemapLinksFromRobots(robotsText) {
-  // robots.txt can include multiple lines: Sitemap: https://example.com/sitemap.xml
+function parseRobotsForSitemaps(text) {
   const out = [];
-  const lines = robotsText.split(/\r?\n/);
-  for (const line of lines) {
-    const m = line.match(/^\s*sitemap\s*:\s*(.+)\s*$/i);
-    if (m && m[1]) out.push(m[1].trim());
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const match = line.match(/^\s*sitemap\s*:\s*(.+?)\s*$/i);
+    if (!match?.[1]) continue;
+    const cleaned = match[1].replace(/\s+#.*$/, "").trim();
+    if (cleaned) out.push(cleaned);
   }
-  return out;
+  return Array.from(new Set(out));
 }
 
-function extractSitemapRelLinkFromDom() {
-  // Some sites use: <link rel="sitemap" type="application/xml" href="/sitemap.xml" />
-  const links = Array.from(document.querySelectorAll('link[rel="sitemap"][href]'));
-  return links.map(l => l.getAttribute("href")).filter(Boolean);
+function candidateSitemapUrls(origin) {
+  return [
+    `${origin}/sitemap.xml`,
+    `${origin}/sitemap_index.xml`,
+    `${origin}/sitemap-index.xml`,
+    `${origin}/sitemap.xml.gz`,
+    `${origin}/sitemap-index.xml.gz`,
+    `${origin}/sitemap_index.xml.gz`
+  ];
 }
 
-function parseXmlLocs(xmlText) {
-  // Parse sitemap XML and return list of <loc> contents.
-  // Handles both urlset and sitemapindex (index returns child sitemap URLs).
+async function responseToSitemapText(res, sitemapUrl, state) {
+  const encoding = (res.headers.get("content-encoding") || "").toLowerCase();
+  const looksGzip = encoding.includes("gzip") || sitemapUrl.toLowerCase().endsWith(".gz");
+
+  if (!looksGzip) {
+    return res.text();
+  }
+
+  if (typeof DecompressionStream === "undefined") {
+    pushError(state, `Cannot parse gzip sitemap ${sitemapUrl}: DecompressionStream unavailable.`);
+    return null;
+  }
+
+  try {
+    const ab = await res.arrayBuffer();
+    const ds = new DecompressionStream("gzip");
+    const decompressed = new Response(new Blob([ab]).stream().pipeThrough(ds));
+    return await decompressed.text();
+  } catch (err) {
+    pushError(state, `Failed to decompress gzip sitemap ${sitemapUrl}: ${errMsg(err)}`);
+    return null;
+  }
+}
+
+function parseSitemapXml(xmlText, sitemapUrl, state) {
   const parser = new DOMParser();
   const doc = parser.parseFromString(xmlText, "application/xml");
-
-  // If parse error:
-  const parseErr = doc.querySelector("parsererror");
-  if (parseErr) return { locs: [], isIndex: false, parseError: true };
-
-  const locEls = Array.from(doc.getElementsByTagName("loc"));
-  const locs = locEls.map(el => el.textContent?.trim()).filter(Boolean);
-
-  const root = doc.documentElement?.tagName?.toLowerCase();
-  const isIndex = root === "sitemapindex";
-
-  return { locs, isIndex, parseError: false };
-}
-
-async function discoverCandidateSitemaps(origin) {
-  const candidates = new Set();
-
-  // 1) Common defaults
-  candidates.add(`${origin}/sitemap.xml`);
-  candidates.add(`${origin}/sitemap_index.xml`);
-  candidates.add(`${origin}/sitemap-index.xml`);
-
-  // 2) <link rel="sitemap" ...> on page
-  for (const href of extractSitemapRelLinkFromDom()) {
-    try {
-      candidates.add(new URL(href, origin).toString());
-    } catch {}
+  if (doc.querySelector("parsererror")) {
+    pushError(state, `XML parse error in ${sitemapUrl}.`);
+    return null;
   }
 
-  // 3) robots.txt "Sitemap:" directives
+  const rootName = (
+    doc.documentElement?.localName ||
+    doc.documentElement?.tagName ||
+    ""
+  ).toLowerCase();
+
+  const locNodes = Array.from(doc.getElementsByTagName("loc"));
+  const locs = [];
+  for (const node of locNodes) {
+    const raw = node.textContent?.trim();
+    if (!raw) continue;
+
+    const resolved = safeUrl(raw, sitemapUrl);
+    if (!resolved) {
+      pushError(state, `Invalid <loc> in ${sitemapUrl}: ${raw}`);
+      continue;
+    }
+    locs.push(resolved.toString());
+  }
+
+  if (rootName === "sitemapindex") {
+    return { kind: "sitemapindex", locs };
+  }
+  if (rootName === "urlset") {
+    return { kind: "urlset", locs };
+  }
+
+  pushError(state, `Unknown sitemap format at ${sitemapUrl}.`);
+  return null;
+}
+
+async function fetchAndParseSitemap(url, depth, state) {
+  if (depth > state.limits.maxDepth) {
+    pushError(state, `Max sitemap depth exceeded at ${url}.`);
+    return;
+  }
+
+  const sitemapUrl = safeUrl(url, state.origin)?.toString();
+  if (!sitemapUrl) {
+    pushError(state, `Invalid sitemap URL: ${url}`);
+    pushTried(state, url, 0, "invalid-url");
+    return;
+  }
+
+  if (state.visitedSitemaps.has(sitemapUrl)) return;
+
+  if (state.sitemapsFetched >= state.limits.maxSitemapsFetched) {
+    pushError(state, `Max sitemaps fetched reached (${state.limits.maxSitemapsFetched}).`);
+    return;
+  }
+
+  state.visitedSitemaps.add(sitemapUrl);
+  state.sitemapsFetched += 1;
+
+  let res;
   try {
-    const robots = await fetchTextCapped(`${origin}/robots.txt`);
-    for (const s of extractSitemapLinksFromRobots(robots)) {
-      try {
-        candidates.add(new URL(s, origin).toString());
-      } catch {}
+    res = await fetch(sitemapUrl, { credentials: "omit", cache: "no-store" });
+  } catch (err) {
+    pushTried(state, sitemapUrl, 0, errMsg(err));
+    pushError(state, `Fetch failed for ${sitemapUrl}: ${errMsg(err)}`);
+    return;
+  }
+
+  pushTried(state, sitemapUrl, res.status);
+  if (!res.ok) {
+    pushError(state, `Sitemap fetch failed ${res.status} for ${sitemapUrl}.`);
+    return;
+  }
+
+  const xmlText = await responseToSitemapText(res, sitemapUrl, state);
+  if (!xmlText) return;
+
+  const parsed = parseSitemapXml(xmlText, sitemapUrl, state);
+  if (!parsed) return;
+
+  if (!state.primarySitemapUrl) {
+    state.primarySitemapUrl = sitemapUrl;
+  }
+
+  if (parsed.kind === "urlset") {
+    for (const loc of parsed.locs) {
+      if (state.urls.size >= state.limits.maxUrlsStored) {
+        markTruncated(state);
+        break;
+      }
+
+      const normalized = normalizeUrl(loc);
+      if (!normalized) continue;
+      state.urls.add(normalized);
     }
-  } catch {
-    // ignore robots.txt failures
+    return;
   }
 
-  return Array.from(candidates);
-}
-
-async function tryGetSitemapUrlsFromSitemapUrl(sitemapUrl, depth = 0) {
-  // depth: follow sitemap indexes a bit, but not infinitely
-  if (depth > 2) return { pageUrls: [], seenSitemaps: [sitemapUrl] };
-
-  const xml = await fetchTextCapped(sitemapUrl);
-  const { locs, isIndex, parseError } = parseXmlLocs(xml);
-  if (parseError) return { pageUrls: [], seenSitemaps: [sitemapUrl] };
-
-  if (!isIndex) {
-    return { pageUrls: locs, seenSitemaps: [sitemapUrl] };
+  if (depth >= state.limits.maxDepth) {
+    pushError(state, `Max sitemap recursion depth reached at ${sitemapUrl}.`);
+    return;
   }
 
-  // It's a sitemap index; locs are child sitemap URLs
-  const allPageUrls = [];
-  const allSeen = [sitemapUrl];
+  for (const childSitemap of parsed.locs) {
+    if (state.sitemapsFetched >= state.limits.maxSitemapsFetched) {
+      pushError(state, `Max sitemaps fetched reached (${state.limits.maxSitemapsFetched}).`);
+      break;
+    }
 
-  for (const child of locs.slice(0, 50)) { // cap number of child sitemaps
-    try {
-      const childRes = await tryGetSitemapUrlsFromSitemapUrl(child, depth + 1);
-      allSeen.push(...childRes.seenSitemaps);
-      allPageUrls.push(...childRes.pageUrls);
-      if (allPageUrls.length >= MAX_URLS) break;
-    } catch {
-      // ignore child failures
+    await fetchAndParseSitemap(childSitemap, depth + 1, state);
+
+    if (state.urls.size >= state.limits.maxUrlsStored) {
+      markTruncated(state);
+      break;
     }
   }
-
-  return { pageUrls: allPageUrls.slice(0, MAX_URLS), seenSitemaps: allSeen };
 }
 
 async function scanAndStore() {
   const origin = location.origin;
-  const key = originKey(origin);
-
-  // Avoid scanning chrome://, extensions, file://, etc.
   if (!origin.startsWith("http")) return;
 
-  // Cache / TTL check
-  const existing = await chrome.storage.local.get(key);
-  const record = existing?.[key];
-  if (record?.scannedAt && now() - record.scannedAt < TTL_MS) return;
+  const key = originKey(origin);
 
-  const candidates = await discoverCandidateSitemaps(origin);
+  const state = {
+    origin,
+    urls: new Set(),
+    tried: [],
+    errors: [],
+    visitedSitemaps: new Set(),
+    sitemapsFetched: 0,
+    primarySitemapUrl: null,
+    truncated: false,
+    limits: { ...LIMITS }
+  };
 
-  let foundSitemap = null;
-  let foundUrls = [];
-  let tried = [];
-  let seenSitemaps = [];
+  try {
+    const existing = await chrome.storage.local.get(key);
+    const record = existing?.[key];
+    if (record?.scannedAt && now() - record.scannedAt < TTL_MS) return;
+  } catch (err) {
+    pushError(state, `Cache read failed: ${errMsg(err)}`);
+  }
 
-  for (const c of candidates) {
-    tried.push(c);
+  try {
+    const robotsUrl = `${origin}/robots.txt`;
+    let robotsSitemaps = [];
+
     try {
-      const { pageUrls, seenSitemaps: seen } = await tryGetSitemapUrlsFromSitemapUrl(c);
-      if (pageUrls && pageUrls.length) {
-        foundSitemap = c;
-        seenSitemaps = seen;
-        foundUrls = pageUrls;
+      const robotsRes = await fetch(robotsUrl, { credentials: "omit", cache: "no-store" });
+      pushTried(state, robotsUrl, robotsRes.status);
+
+      if (robotsRes.ok) {
+        const robotsText = await robotsRes.text();
+        robotsSitemaps = parseRobotsForSitemaps(robotsText)
+          .map(s => safeUrl(s, origin)?.toString())
+          .filter(Boolean);
+      } else {
+        pushError(state, `robots.txt fetch failed ${robotsRes.status}.`);
+      }
+    } catch (err) {
+      pushTried(state, robotsUrl, 0, errMsg(err));
+      pushError(state, `robots.txt fetch failed: ${errMsg(err)}`);
+    }
+
+    const sitemapCandidates = robotsSitemaps.length
+      ? robotsSitemaps
+      : candidateSitemapUrls(origin);
+
+    const uniqueCandidates = Array.from(new Set(sitemapCandidates));
+    for (const candidate of uniqueCandidates) {
+      if (state.sitemapsFetched >= state.limits.maxSitemapsFetched) {
+        pushError(state, `Max sitemaps fetched reached (${state.limits.maxSitemapsFetched}).`);
         break;
       }
-    } catch {
-      // try next
+      await fetchAndParseSitemap(candidate, 0, state);
     }
+  } catch (err) {
+    pushError(state, `Unexpected scan error: ${errMsg(err)}`);
   }
 
-  // Clean + dedupe + keep only same-origin URLs (optional, but matches your “site sitemap” intent)
-  const cleanedSet = new Set();
-  for (const u of foundUrls) {
-    const norm = normalizeUrl(u);
-    if (!norm) continue;
-
-    try {
-      const urlObj = new URL(norm);
-      if (urlObj.origin !== origin) continue; // keep only current origin
-      cleanedSet.add(norm);
-      if (cleanedSet.size >= MAX_URLS) break;
-    } catch {}
-  }
-
-  const cleaned = Array.from(cleanedSet);
+  const urls = Array.from(state.urls).slice(0, state.limits.maxUrlsStored);
+  const found = urls.length > 0;
 
   await chrome.storage.local.set({
     [key]: {
       origin,
+      found,
+      urlCount: urls.length,
+      urls,
       scannedAt: now(),
-      found: Boolean(foundSitemap),
-      sitemapUrl: foundSitemap,
-      sitemapUrlsFollowed: seenSitemaps,
-      urlCount: cleaned.length,
-      urls: cleaned,
-      tried
+      sitemapUrl: found ? state.primarySitemapUrl : null,
+      tried: state.tried,
+      errors: state.errors,
+      truncated: state.truncated,
+      limits: state.limits
     }
   });
 }
