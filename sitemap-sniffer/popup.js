@@ -19,7 +19,7 @@ async function getActiveTabOrigin() {
 ------------------------- */
 
 function stripLocale(path) {
-  return path.replace(/^\/(fr|en|de|es|it|pt)(\/|$)/, "/");
+  return String(path || "/").replace(/^\/[a-z]{2}(\/|$)/i, "/");
 }
 
 function analyze(urls) {
@@ -50,108 +50,265 @@ function pct(n, d) {
   return `${((n / d) * 100).toFixed(1)}%`;
 }
 
+function getUrlParts(raw) {
+  const src = String(raw || "");
+  try {
+    const url = new URL(src);
+    return {
+      path: (url.pathname || "/").toLowerCase(),
+      hasQuery: Boolean(url.search),
+      hasHash: Boolean(url.hash),
+      raw: src.toLowerCase()
+    };
+  } catch {
+    const lower = src.toLowerCase();
+    return {
+      path: (lower.split(/[?#]/)[0] || "/"),
+      hasQuery: lower.includes("?"),
+      hasHash: lower.includes("#"),
+      raw: lower
+    };
+  }
+}
+
 function countMatches(urls, needle) {
   const s = String(needle || "").toLowerCase();
   if (!s) return 0;
 
   let count = 0;
   for (const u of urls || []) {
-    let haystack = "";
-    try {
-      haystack = new URL(u).pathname.toLowerCase();
-    } catch {
-      haystack = String(u || "").toLowerCase();
-    }
-
-    if (haystack.includes(s)) count += 1;
+    const { path, raw } = getUrlParts(u);
+    if ((path || raw).includes(s)) count += 1;
   }
 
   return count;
+}
+
+function countRegexMatches(urls, regex) {
+  if (!(regex instanceof RegExp)) return 0;
+
+  let count = 0;
+  for (const u of urls || []) {
+    const { path } = getUrlParts(u);
+    regex.lastIndex = 0;
+    if (regex.test(path)) count += 1;
+  }
+
+  return count;
+}
+
+function countAnyMatches(urls, needles) {
+  const parts = Array.isArray(needles)
+    ? needles.map(n => String(n || "").toLowerCase()).filter(Boolean)
+    : [];
+  if (!parts.length) return 0;
+
+  let count = 0;
+  for (const u of urls || []) {
+    const { path, raw } = getUrlParts(u);
+    const haystack = path || raw;
+    if (parts.some(p => haystack.includes(p))) count += 1;
+  }
+  return count;
+}
+
+function detectPlatform(urls) {
+  const total = Array.isArray(urls) ? urls.length : 0;
+  if (!total) return "generic";
+
+  const shopifyRatio =
+    (countMatches(urls, "/products/") + countMatches(urls, "/collections/")) / total;
+  if (shopifyRatio > 0.25) return "shopify";
+
+  const hasWpCoreSignals =
+    countMatches(urls, "/wp-content/") > 0 || countMatches(urls, "/wp-json/") > 0;
+  const wpTaxRatio = countAnyMatches(urls, ["/category/", "/tag/"]) / total;
+  const wpDateRatio = countRegexMatches(urls, /\/\d{4}\/\d{2}(\/|$)/) / total;
+  if (hasWpCoreSignals || wpTaxRatio > 0.10 || wpDateRatio > 0.10) return "wordpress";
+
+  const docsDominance = countAnyMatches(urls, ["/docs/", "/guides/", "/api/"]) / total;
+  if (docsDominance > 0.50) return "docs";
+
+  return "generic";
 }
 
 function buildAlerts(allUrls) {
   const urls = Array.isArray(allUrls) ? allUrls : [];
   const totalUrls = urls.length;
   const alerts = [];
+  const platform = detectPlatform(urls);
 
   if (!totalUrls) {
-    return [{ level: "green", msg: "No obvious red flags detected." }];
+    return {
+      platform,
+      alerts: [{ level: "green", msg: "No obvious red flags detected." }]
+    };
   }
 
-  const { types, depths, canonicalCount } = analyze(urls);
+  const bucketCounts = {};
+  const canonical = new Set();
+  const locales = new Set();
+  let maxDepth = 0;
+  let deep7Count = 0;
+  let deep8Count = 0;
 
-  // A) Canonical ratio
+  for (const u of urls) {
+    const { path } = getUrlParts(u);
+    const m = path.match(/^\/([a-z]{2})\//i);
+    if (m) locales.add(m[1].toLowerCase());
+
+    const cleanPath = stripLocale(path);
+    canonical.add(cleanPath);
+
+    const parts = cleanPath.split("/").filter(Boolean);
+    const depth = parts.length;
+    if (depth > maxDepth) maxDepth = depth;
+    if (depth >= 7) deep7Count += 1;
+    if (depth >= 8) deep8Count += 1;
+
+    const bucket = parts[0] || "root";
+    bucketCounts[bucket] = (bucketCounts[bucket] || 0) + 1;
+  }
+  const canonicalCount = canonical.size;
+
+  // Canonical ratio (looser thresholds when multiple locales are detected)
   const canonicalRatio = canonicalCount / totalUrls;
-  if (canonicalRatio < 0.35) {
+  const hasMultipleLocales = locales.size >= 2;
+  const canonicalRed = hasMultipleLocales ? 0.25 : 0.35;
+  const canonicalYellow = hasMultipleLocales ? 0.45 : 0.60;
+  if (canonicalRatio < canonicalRed) {
     alerts.push({
       level: "red",
       msg: `Low canonical ratio: ${pct(canonicalCount, totalUrls)} (${canonicalCount}/${totalUrls}).`
     });
-  } else if (canonicalRatio <= 0.60) {
+  } else if (canonicalRatio < canonicalYellow) {
     alerts.push({
       level: "yellow",
       msg: `Canonical ratio is borderline: ${pct(canonicalCount, totalUrls)} (${canonicalCount}/${totalUrls}).`
     });
   }
 
-  // B) Unexpected types
-  const known = new Set(["products", "collections", "pages", "blogs", "root"]);
-  let unknownCount = 0;
-  for (const [type, count] of Object.entries(types)) {
-    if (!known.has(type)) unknownCount += count;
+  // Universal bucket alerts by first path segment after optional locale stripping
+  const bucketEntries = Object.entries(bucketCounts);
+  const distinctBuckets = bucketEntries.length;
+  let topBucketName = "root";
+  let topBucketCount = 0;
+  for (const [name, count] of bucketEntries) {
+    if (count > topBucketCount) {
+      topBucketName = name;
+      topBucketCount = count;
+    }
   }
-  const unknownRatio = unknownCount / totalUrls;
-  if (unknownRatio > 0.01) {
-    alerts.push({
-      level: "red",
-      msg: `Unexpected URL types are high: ${pct(unknownCount, totalUrls)} (${unknownCount}/${totalUrls}).`
-    });
-  } else if (unknownRatio > 0.002) {
+  const topBucketRatio = topBucketCount / totalUrls;
+
+  if (distinctBuckets > 25) {
     alerts.push({
       level: "yellow",
-      msg: `Unexpected URL types detected: ${pct(unknownCount, totalUrls)} (${unknownCount}/${totalUrls}).`
+      msg: `High bucket diversity: ${distinctBuckets} top-level buckets.`
+    });
+  }
+  if (topBucketRatio > 0.90) {
+    alerts.push({
+      level: "yellow",
+      msg: `Top bucket "${topBucketName}" dominates: ${pct(topBucketCount, totalUrls)} (${topBucketCount}/${totalUrls}).`
     });
   }
 
-  // C) Deep URLs (depth >= 5)
-  let deepCount = 0;
-  for (const [depth, count] of Object.entries(depths)) {
-    if (Number(depth) >= 5) deepCount += count;
-  }
-  const deepRatio = deepCount / totalUrls;
-  if (deepRatio > 0.10) {
+  // Relative depth alerts
+  const deep7Ratio = deep7Count / totalUrls;
+  const deep8Ratio = deep8Count / totalUrls;
+  if (deep8Ratio > 0.05 || maxDepth >= 12) {
     alerts.push({
       level: "red",
-      msg: `Too many deep URLs (depth >= 5): ${pct(deepCount, totalUrls)} (${deepCount}/${totalUrls}).`
+      msg: `Deep URL risk: depth>=8 is ${pct(deep8Count, totalUrls)} (${deep8Count}/${totalUrls}); max depth is ${maxDepth}.`
     });
-  } else if (deepRatio > 0.03) {
+  } else if (deep7Ratio > 0.10) {
     alerts.push({
       level: "yellow",
-      msg: `Deep URL share is elevated (depth >= 5): ${pct(deepCount, totalUrls)} (${deepCount}/${totalUrls}).`
+      msg: `Depth>=7 share is elevated: ${pct(deep7Count, totalUrls)} (${deep7Count}/${totalUrls}).`
     });
   }
 
-  // D) "copy-of" products
-  const copyOfCount = countMatches(urls, "/products/copy-of-");
-  const productCount = types["products"] || 0;
-  const copyRatio = productCount ? copyOfCount / productCount : 0;
-  if (copyRatio > 0.02) {
+  // Universal junk sitemap checks
+  const queryCount = urls.reduce((n, u) => n + (getUrlParts(u).hasQuery ? 1 : 0), 0);
+  const queryRatio = queryCount / totalUrls;
+  if (queryRatio > 0.01) {
     alerts.push({
       level: "red",
-      msg: `High "copy-of" product ratio: ${pct(copyOfCount, productCount)} (${copyOfCount}/${productCount}).`
+      msg: `Too many URLs with query params: ${pct(queryCount, totalUrls)} (${queryCount}/${totalUrls}).`
     });
-  } else if (copyRatio > 0.005) {
+  } else if (queryRatio > 0.002) {
     alerts.push({
       level: "yellow",
-      msg: `"copy-of" products detected: ${pct(copyOfCount, productCount)} (${copyOfCount}/${productCount}).`
+      msg: `URLs with query params detected: ${pct(queryCount, totalUrls)} (${queryCount}/${totalUrls}).`
     });
+  }
+
+  const hashCount = urls.reduce((n, u) => n + (getUrlParts(u).hasHash ? 1 : 0), 0);
+  if (hashCount > 0) {
+    alerts.push({
+      level: "red",
+      msg: `Hash fragments found in sitemap URLs: ${hashCount}/${totalUrls}.`
+    });
+  }
+
+  const systemCount = countAnyMatches(urls, [
+    "/admin",
+    "/login",
+    "/cart",
+    "/checkout",
+    "/wp-admin",
+    "/_next",
+    "/assets",
+    "/cdn"
+  ]);
+  const systemRatio = systemCount / totalUrls;
+  if (systemRatio > 0.01) {
+    alerts.push({
+      level: "red",
+      msg: `System-like paths are high: ${pct(systemCount, totalUrls)} (${systemCount}/${totalUrls}).`
+    });
+  } else if (systemRatio > 0.002) {
+    alerts.push({
+      level: "yellow",
+      msg: `System-like paths detected: ${pct(systemCount, totalUrls)} (${systemCount}/${totalUrls}).`
+    });
+  }
+
+  // Platform-specific checks
+  if (platform === "shopify") {
+    const copyOfCount = countMatches(urls, "/products/copy-of-");
+    const productCount = bucketCounts["products"] || 0;
+    const copyRatio = productCount ? copyOfCount / productCount : 0;
+    if (copyRatio > 0.02) {
+      alerts.push({
+        level: "red",
+        msg: `High "copy-of" product ratio: ${pct(copyOfCount, productCount)} (${copyOfCount}/${productCount}).`
+      });
+    } else if (copyRatio > 0.005) {
+      alerts.push({
+        level: "yellow",
+        msg: `"copy-of" products detected: ${pct(copyOfCount, productCount)} (${copyOfCount}/${productCount}).`
+      });
+    }
+  }
+
+  if (platform === "wordpress") {
+    const tagCategoryCount = countAnyMatches(urls, ["/tag/", "/category/"]);
+    const tagCategoryRatio = tagCategoryCount / totalUrls;
+    if (tagCategoryRatio > 0.30) {
+      alerts.push({
+        level: "yellow",
+        msg: `Tag/category pages are heavy: ${pct(tagCategoryCount, totalUrls)} (${tagCategoryCount}/${totalUrls}).`
+      });
+    }
   }
 
   if (!alerts.length) {
     alerts.push({ level: "green", msg: "No obvious red flags detected." });
   }
 
-  return alerts;
+  return { platform, alerts };
 }
 
 function renderAlerts(allUrls) {
@@ -160,10 +317,18 @@ function renderAlerts(allUrls) {
 
   const icons = { green: "✅", yellow: "⚠️", red: "🚩" };
   const colors = { green: "#1d6f42", yellow: "#8a5a00", red: "#a31818" };
-  const alerts = buildAlerts(allUrls);
+  const labels = {
+    shopify: "Shopify",
+    wordpress: "WP",
+    docs: "Docs",
+    generic: "Generic"
+  };
+  const { platform, alerts } = buildAlerts(allUrls);
 
-  alertsEl.innerHTML = alerts
-    .map(a => `<div class="stat" style="color:${colors[a.level] || "inherit"};">${icons[a.level] || "✅"} ${a.msg}</div>`)
+  alertsEl.innerHTML = [
+    `<div class="stat"><b>Platform: ${labels[platform] || "Generic"}</b></div>`,
+    ...alerts.map(a => `<div class="stat" style="color:${colors[a.level] || "inherit"};">${icons[a.level] || "✅"} ${a.msg}</div>`)
+  ]
     .join("");
 }
 
